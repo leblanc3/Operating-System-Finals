@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import random
+import colorsys
 from tkinter import messagebox
-
 
 ALLOC_COLORS = [
     "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
@@ -16,7 +16,6 @@ ALLOC_COLORS = [
 ]
 FREE_COLOR = "#2d2d44"
 FRAG_COLOR = "#1a1a2e"
-
 
 class MemoryBlock:
     def __init__(self, start, size, pid=None):
@@ -32,27 +31,47 @@ class MemoryBlock:
     def is_free(self):
         return self.pid is None
 
-
 class MemoryManager:
-    def __init__(self, total=1024):
+    def __init__(self, total=1024, os_size=128):
         self.total = total
-        self.blocks = [MemoryBlock(0, total)]
-        self.last_fit_pos = 0
+        self.os_size = os_size
+        self.blocks = []
+        if os_size > 0:
+            self.blocks.append(MemoryBlock(0, os_size, "OS"))
+            if total > os_size:
+                self.blocks.append(MemoryBlock(os_size, total - os_size))
+        else:
+            self.blocks.append(MemoryBlock(0, total))
+        self.last_fit_pos = os_size
         self.color_map = {}
         self._color_idx = 0
+        self.auto_compact = False
 
-    def reset(self, total=None):
-        if total:
+    def reset(self, total=None, os_size=None):
+        if total is not None:
             self.total = total
-        self.blocks = [MemoryBlock(0, self.total)]
-        self.last_fit_pos = 0
+        if os_size is not None:
+            self.os_size = os_size
+        self.blocks = []
+        if self.os_size > 0:
+            self.blocks.append(MemoryBlock(0, self.os_size, "OS"))
+            if self.total > self.os_size:
+                self.blocks.append(MemoryBlock(self.os_size, self.total - self.os_size))
+        else:
+            self.blocks.append(MemoryBlock(0, self.total))
+        self.last_fit_pos = self.os_size
         self.color_map = {}
         self._color_idx = 0
 
     def _get_color(self, pid):
+        if pid == "OS":
+            return "#164e63"
         if pid not in self.color_map:
-            self.color_map[pid] = ALLOC_COLORS[self._color_idx % len(ALLOC_COLORS)]
             self._color_idx += 1
+            # Dynamic HSL generation from user's web version style
+            h = (self._color_idx * 137 % 360) / 360.0
+            r, g, b = colorsys.hls_to_rgb(h, 0.45, 0.65)
+            self.color_map[pid] = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
         return self.color_map[pid]
 
     def get_free_holes(self):
@@ -67,9 +86,13 @@ class MemoryManager:
         return total_free - largest
 
     def allocate(self, pid, size, method="First Fit"):
+        if self.auto_compact:
+            self.compact()
+            
         holes = [(i, b) for i, b in enumerate(self.blocks) if b.is_free and b.size >= size]
         if not holes:
-            return False, "No suitable hole found"
+            return False, "Not enough contiguous memory. Try compacting!"
+            
         if method == "First Fit":
             idx, hole = holes[0]
         elif method == "Best Fit":
@@ -82,6 +105,7 @@ class MemoryManager:
             self.last_fit_pos = hole.start
         else:
             idx, hole = holes[0]
+            
         self._allocate_in_hole(idx, hole, pid, size)
         return True, f"Allocated {size}KB to {pid}"
 
@@ -98,7 +122,17 @@ class MemoryManager:
             if b.pid == pid:
                 b.pid = None
         self._merge_free()
+        if self.auto_compact:
+            self.compact()
         return True
+
+    def clear(self):
+        for b in self.blocks:
+            if b.pid != "OS" and not b.is_free:
+                b.pid = None
+        self._merge_free()
+        if self.auto_compact:
+            self.compact()
 
     def _merge_free(self):
         merged = []
@@ -126,18 +160,19 @@ class MemoryManager:
         pages = []
         frames = self.total // page_size
         for b in self.blocks:
-            if not b.is_free:
+            if not b.is_free and b.pid != "OS":
                 num_pages = (b.size + page_size - 1) // page_size
                 for i in range(num_pages):
                     pages.append({'pid': b.pid, 'page': i, 'frame': len(pages) % frames})
         return pages, frames
 
-
 class MemoryManagementFrame(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent, fg_color="transparent")
-        self.mm = MemoryManager(1024)
+        self.mm = MemoryManager(1024, 128)
         self.history = []
+        self.pid_counter = 1
+        self.rect_map = []
         self._build_ui()
 
     def _build_ui(self):
@@ -153,25 +188,44 @@ class MemoryManagementFrame(ctk.CTkFrame):
         ctk.CTkLabel(left, text="💾 Memory Configuration", font=("Courier New", 14, "bold")).grid(
             row=0, column=0, columnspan=2, padx=16, pady=(16, 8), sticky="w")
 
-        # Memory size
+        # Memory size & OS size setup
         sz_frame = ctk.CTkFrame(left, fg_color="transparent")
         sz_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
-        ctk.CTkLabel(sz_frame, text="Total Memory (KB):", font=("Courier New", 11)).pack(side="left")
+        
+        ctk.CTkLabel(sz_frame, text="Total(KB):", font=("Courier New", 11)).grid(row=0, column=0, sticky="w")
         self.mem_size_var = ctk.IntVar(value=1024)
-        ctk.CTkSlider(sz_frame, from_=256, to=4096, variable=self.mem_size_var, width=120).pack(side="left", padx=8)
+        ctk.CTkSlider(sz_frame, from_=256, to=4096, variable=self.mem_size_var, width=100).grid(row=0, column=1, padx=4)
         self.mem_size_label = ctk.CTkLabel(sz_frame, text="1024", font=("Courier New", 11, "bold"), text_color="#4ECDC4")
-        self.mem_size_label.pack(side="left")
+        self.mem_size_label.grid(row=0, column=2, sticky="w")
         self.mem_size_var.trace_add("write", lambda *_: self.mem_size_label.configure(text=str(self.mem_size_var.get())))
-        ctk.CTkButton(sz_frame, text="Reset", command=self._reset_memory, width=60,
-                      fg_color="#FF6B6B", text_color="#fff", font=("Courier New", 11)).pack(side="left", padx=8)
+        
+        ctk.CTkLabel(sz_frame, text="OS(KB):", font=("Courier New", 11)).grid(row=1, column=0, sticky="w", pady=4)
+        self.os_size_var = ctk.IntVar(value=128)
+        ctk.CTkSlider(sz_frame, from_=0, to=1024, variable=self.os_size_var, width=100).grid(row=1, column=1, padx=4, pady=4)
+        self.os_size_label = ctk.CTkLabel(sz_frame, text="128", font=("Courier New", 11, "bold"), text_color="#4ECDC4")
+        self.os_size_label.grid(row=1, column=2, sticky="w", pady=4)
+        self.os_size_var.trace_add("write", lambda *_: self.os_size_label.configure(text=str(self.os_size_var.get())))
 
-        # Algorithm
-        ctk.CTkLabel(left, text="Algorithm:", font=("Courier New", 11)).grid(row=2, column=0, padx=16, pady=4, sticky="w")
+        btn_frame = ctk.CTkFrame(sz_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, columnspan=3, pady=4, sticky="w")
+        ctk.CTkButton(btn_frame, text="Init/Reset", command=self._reset_memory, width=70,
+                      fg_color="#FF6B6B", text_color="#fff", font=("Courier New", 11)).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_frame, text="Clear", command=self._clear_memory, width=60,
+                      fg_color="#F7DC6F", text_color="#000", font=("Courier New", 11)).pack(side="left", padx=4)
+
+        # Algorithm and Auto Compact
+        algo_frame = ctk.CTkFrame(left, fg_color="transparent")
+        algo_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+        ctk.CTkLabel(algo_frame, text="Algorithm:", font=("Courier New", 11)).pack(side="left")
         self.method_var = ctk.StringVar(value="First Fit")
-        ctk.CTkOptionMenu(left, values=["First Fit", "Best Fit", "Worst Fit", "Next Fit"],
+        ctk.CTkOptionMenu(algo_frame, values=["First Fit", "Best Fit", "Worst Fit", "Next Fit"],
                           variable=self.method_var, font=("Courier New", 11),
-                          fg_color="#2d2d44", button_color="#4ECDC4",
-                          button_hover_color="#3ab8ae").grid(row=2, column=1, padx=12, pady=4, sticky="ew")
+                          fg_color="#2d2d44", button_color="#4ECDC4", width=100,
+                          button_hover_color="#3ab8ae").pack(side="left", padx=8)
+        self.auto_compact_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(algo_frame, text="Auto Compact", variable=self.auto_compact_var,
+                        font=("Courier New", 11), fg_color="#4ECDC4", hover_color="#3ab8ae",
+                        command=self._on_auto_compact_change).pack(side="left", padx=4)
 
         # Allocation inputs
         ctk.CTkLabel(left, text="── Allocate Process ──", font=("Courier New", 11), text_color="#4ECDC4").grid(
@@ -179,11 +233,8 @@ class MemoryManagementFrame(ctk.CTkFrame):
 
         alloc_frame = ctk.CTkFrame(left, fg_color="transparent")
         alloc_frame.grid(row=4, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
-        ctk.CTkLabel(alloc_frame, text="PID:", font=("Courier New", 11)).pack(side="left")
-        self.alloc_pid = ctk.CTkEntry(alloc_frame, width=60, placeholder_text="P1", font=("Courier New", 11))
-        self.alloc_pid.pack(side="left", padx=6)
         ctk.CTkLabel(alloc_frame, text="Size(KB):", font=("Courier New", 11)).pack(side="left")
-        self.alloc_size = ctk.CTkEntry(alloc_frame, width=70, placeholder_text="256", font=("Courier New", 11))
+        self.alloc_size = ctk.CTkEntry(alloc_frame, width=140, placeholder_text="Enter size (e.g., 256)", font=("Courier New", 11))
         self.alloc_size.pack(side="left", padx=6)
 
         ctk.CTkButton(left, text="✔ Allocate", command=self._allocate,
@@ -200,11 +251,8 @@ class MemoryManagementFrame(ctk.CTkFrame):
 
         dealloc_frame = ctk.CTkFrame(left, fg_color="transparent")
         dealloc_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
-        ctk.CTkLabel(dealloc_frame, text="PID:", font=("Courier New", 11)).pack(side="left")
-        self.dealloc_pid = ctk.CTkEntry(dealloc_frame, width=80, placeholder_text="P1", font=("Courier New", 11))
-        self.dealloc_pid.pack(side="left", padx=6)
-        ctk.CTkButton(dealloc_frame, text="✘ Free", command=self._deallocate,
-                      fg_color="#FF6B6B", text_color="#fff", font=("Courier New", 11)).pack(side="left", padx=6)
+        ctk.CTkLabel(dealloc_frame, text="💡 Click a process block in the\nMemory Map graph to kill it.", 
+                     font=("Courier New", 11, "italic"), text_color="#aaa", justify="center").pack(side="left", fill="x", expand=True, padx=6)
 
         # Compaction
         ctk.CTkLabel(left, text="── Compaction ──", font=("Courier New", 11), text_color="#FFEAA7").grid(
@@ -238,6 +286,7 @@ class MemoryManagementFrame(ctk.CTkFrame):
         self.mem_fig.patch.set_facecolor("#1a1a2e")
         self.mem_canvas = FigureCanvasTkAgg(self.mem_fig, master=tab.tab("Memory Map"))
         self.mem_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.mem_canvas.mpl_connect('button_press_event', self._on_canvas_click)
 
         # Paging tab
         paging_ctrl = ctk.CTkFrame(tab.tab("Paging"), fg_color="transparent")
@@ -259,49 +308,82 @@ class MemoryManagementFrame(ctk.CTkFrame):
 
         self._draw_memory_map()
 
+    def _on_canvas_click(self, event):
+        if event.inaxes != self.mem_ax:
+            return
+            
+        click_y = event.ydata
+        if click_y is None:
+            return
+            
+        for y_start, y_end, pid in self.rect_map:
+            if y_start <= click_y <= y_end:
+                if messagebox.askyesno("Kill Process", f"Do you want to deallocate process {pid}?"):
+                    self.mm.deallocate(pid)
+                    self._draw_memory_map()
+                    self._update_stats()
+                break
+
     def _reset_memory(self):
-        self.mm.reset(self.mem_size_var.get())
+        tot = self.mem_size_var.get()
+        os_sz = self.os_size_var.get()
+        if os_sz >= tot:
+            messagebox.showerror("Error", "OS size must be less than Total Memory")
+            return
+        self.pid_counter = 1
+        self.mm.reset(tot, os_sz)
         self._draw_memory_map()
         self._update_stats()
 
+    def _clear_memory(self):
+        self.pid_counter = 1
+        self.mm.clear()
+        self._draw_memory_map()
+        self._update_stats()
+
+    def _on_auto_compact_change(self):
+        self.mm.auto_compact = self.auto_compact_var.get()
+        if self.mm.auto_compact:
+            self.mm.compact()
+            self._draw_memory_map()
+            self._update_stats()
+
     def _allocate(self):
-        pid = self.alloc_pid.get().strip()
+        val = self.alloc_size.get().strip()
+        if not val:
+            messagebox.showerror("Error", "Please enter a size")
+            return
+            
         try:
-            size = int(self.alloc_size.get())
+            size = int(val)
+            if size <= 0:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Error", "Invalid size")
+            messagebox.showerror("Error", "Size must be a positive integer")
             return
-        if not pid:
-            messagebox.showerror("Error", "Enter PID")
-            return
+            
+        pid = f"P{self.pid_counter}"
         ok, msg = self.mm.allocate(pid, size, self.method_var.get())
         if not ok:
             messagebox.showwarning("Allocation Failed", msg)
+        else:
+            self.pid_counter += 1
+            
         self._draw_memory_map()
         self._update_stats()
-        self.alloc_pid.delete(0, "end")
         self.alloc_size.delete(0, "end")
 
     def _random_alloc(self):
         for i in range(random.randint(3, 6)):
-            pid = f"P{i+1}"
+            pid = f"P{self.pid_counter}"
             size = random.randint(64, 256)
-            self.mm.allocate(pid, size, self.method_var.get())
+            ok, _ = self.mm.allocate(pid, size, self.method_var.get())
+            if ok:
+                self.pid_counter += 1
         self._draw_memory_map()
         self._update_stats()
-
-    def _deallocate(self):
-        pid = self.dealloc_pid.get().strip()
-        if not pid:
-            messagebox.showerror("Error", "Enter PID")
-            return
-        self.mm.deallocate(pid)
-        self._draw_memory_map()
-        self._update_stats()
-        self.dealloc_pid.delete(0, "end")
 
     def _compact(self):
-        before_blocks = [MemoryBlock(b.start, b.size, b.pid) for b in self.mm.blocks]
         self.mm.compact()
         self._draw_memory_map(highlight_compact=True)
         self._update_stats()
@@ -312,17 +394,23 @@ class MemoryManagementFrame(ctk.CTkFrame):
         self.mem_ax.set_facecolor("#12122a")
         total = self.mm.total
         y = 0
-        height = 0.8
+        self.rect_map = []
         for block in self.mm.blocks:
             frac = block.size / total
             if block.is_free:
                 color = FREE_COLOR
                 label = f"FREE\n{block.size}KB"
                 tc = "#666"
+            elif block.pid == "OS":
+                color = self.mm._get_color(block.pid)
+                label = f"OS\n{block.size}KB"
+                tc = "#22d3ee"
             else:
-                color = self.mm.color_map.get(block.pid, "#4ECDC4")
+                color = self.mm._get_color(block.pid)
                 label = f"{block.pid}\n{block.size}KB"
-                tc = "#000"
+                tc = "#fff"
+                self.rect_map.append((y, y + frac, block.pid))
+                
             rect = plt.Rectangle((0, y), 1, frac, color=color, edgecolor="#333", linewidth=1)
             self.mem_ax.add_patch(rect)
             if frac > 0.03:
@@ -331,6 +419,7 @@ class MemoryManagementFrame(ctk.CTkFrame):
             self.mem_ax.text(1.02, y, f"{block.start}K", ha='left', va='center',
                              color='#888', fontsize=7, fontfamily='monospace')
             y += frac
+            
         self.mem_ax.text(1.02, y, f"{total}K", ha='left', va='center',
                          color='#888', fontsize=7, fontfamily='monospace')
         self.mem_ax.set_xlim(0, 1.2)
@@ -343,6 +432,7 @@ class MemoryManagementFrame(ctk.CTkFrame):
             sp.set_visible(False)
         self.mem_fig.tight_layout()
         self.mem_canvas.draw()
+        self._draw_paging()
 
     def _draw_paging(self):
         page_size = self.page_size_var.get()
@@ -356,16 +446,18 @@ class MemoryManagementFrame(ctk.CTkFrame):
             self.page_fig.tight_layout()
             self.page_canvas.draw()
             return
+            
         cols = 8
         rows = (len(pages) + cols - 1) // cols
         for i, pg in enumerate(pages):
             row, col = divmod(i, cols)
-            color = self.mm.color_map.get(pg['pid'], "#4ECDC4")
+            color = self.mm._get_color(pg['pid'])
             rect = plt.Rectangle((col, rows - row - 1), 0.9, 0.9, color=color, edgecolor='#000')
             self.page_ax.add_patch(rect)
             self.page_ax.text(col + 0.45, rows - row - 0.55,
                               f"{pg['pid']}\nP{pg['page']}→F{pg['frame']}",
                               ha='center', va='center', fontsize=6, fontfamily='monospace', color='#000')
+                              
         self.page_ax.set_xlim(-0.1, cols)
         self.page_ax.set_ylim(-0.1, rows + 0.1)
         self.page_ax.set_title(f"Page Table (Page={page_size}KB, Frames={num_frames})",
@@ -384,10 +476,12 @@ class MemoryManagementFrame(ctk.CTkFrame):
         self.stats_box.delete("1.0", "end")
         self.stats_box.insert("end",
             f"Total Memory   : {self.mm.total} KB\n"
+            f"OS Size        : {self.mm.os_size} KB\n"
             f"Allocated      : {allocated} KB ({util:.1f}%)\n"
             f"Free           : {free} KB\n"
             f"Holes          : {len(holes)}\n"
             f"Ext. Frag.     : {frag} KB\n"
             f"Method         : {self.method_var.get()}\n"
+            f"Auto Compact   : {'Yes' if self.mm.auto_compact else 'No'}\n"
         )
         self.stats_box.configure(state="disabled")
