@@ -131,7 +131,7 @@ def round_robin(processes, quantum=2):
     procs = [dict(p) for p in processes]
     for p in procs:
         p['remaining'] = p['burst']
-    queue, timeline, time = [], 0, []
+    queue, timeline, time = [], [], 0
     arrived = set()
     remaining_procs = sorted(procs, key=lambda x: x['arrival'])
     ready_queue = []
